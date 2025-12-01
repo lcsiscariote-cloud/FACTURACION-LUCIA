@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import { ConsolidatedRecord, DashboardStats } from '../types';
-import { DollarSign, Activity, AlertTriangle, Users, Download, TrendingUp, CheckCircle } from 'lucide-react';
+import { DollarSign, Activity, AlertTriangle, Users, Download, TrendingUp, History } from 'lucide-react';
 import { exportToExcel } from '../services/excelService';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 
@@ -19,9 +19,10 @@ export const Dashboard: React.FC<Props> = ({ data, onReset }) => {
     return data.reduce((acc, curr) => ({
       totalClients: acc.totalClients + 1,
       totalActiveDevices: acc.totalActiveDevices + curr.counts.totalActive,
+      totalRecentlyDeactivated: acc.totalRecentlyDeactivated + curr.counts.recentlyDeactivated,
       totalEstimatedBilling: acc.totalEstimatedBilling + curr.calculatedTotal,
       clientsWithMissingCost: acc.clientsWithMissingCost + (curr.hasDiscrepancy ? 1 : 0)
-    }), { totalClients: 0, totalActiveDevices: 0, totalEstimatedBilling: 0, clientsWithMissingCost: 0 });
+    }), { totalClients: 0, totalActiveDevices: 0, totalRecentlyDeactivated: 0, totalEstimatedBilling: 0, clientsWithMissingCost: 0 });
   }, [data]);
 
   const topAccounts = data.slice(0, 10).map(d => ({
@@ -36,7 +37,11 @@ export const Dashboard: React.FC<Props> = ({ data, onReset }) => {
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
           <h2 className="text-2xl font-bold text-slate-800">Resultado del Análisis</h2>
-          <p className="text-slate-500 text-sm">Cruce de Plataformas (01-12-25) vs Costos SATECH</p>
+          <div className="flex items-center gap-2 text-slate-500 text-sm">
+            <span className="bg-blue-100 text-blue-700 px-2 py-0.5 rounded text-xs font-medium">
+              +{stats.totalRecentlyDeactivated} Bajas Recientes Cobrables
+            </span>
+          </div>
         </div>
         <div className="flex gap-2">
           <button 
@@ -64,10 +69,11 @@ export const Dashboard: React.FC<Props> = ({ data, onReset }) => {
           color="bg-green-50 border-green-200"
         />
         <StatCard 
-          title="Dispositivos Activos" 
+          title="Dispositivos a Cobrar" 
           value={stats.totalActiveDevices.toLocaleString()} 
           icon={<Activity className="text-blue-600" size={24} />} 
           color="bg-blue-50 border-blue-200"
+          subtext={`Incluye ${stats.totalRecentlyDeactivated} bajas recientes`}
         />
         <StatCard 
           title="Clientes Analizados" 
@@ -122,7 +128,7 @@ export const Dashboard: React.FC<Props> = ({ data, onReset }) => {
               <thead className="bg-slate-50 text-xs uppercase font-semibold text-slate-500 sticky top-0 z-10">
                 <tr>
                   <th className="px-6 py-3">Cuenta / Cliente</th>
-                  <th className="px-6 py-3 text-center">Unidades Activas</th>
+                  <th className="px-6 py-3 text-center">Unidades Cobrables</th>
                   <th className="px-6 py-3 text-right">Costo Unit.</th>
                   <th className="px-6 py-3 text-right">Total a Cobrar</th>
                   <th className="px-6 py-3">Tipo</th>
@@ -139,9 +145,18 @@ export const Dashboard: React.FC<Props> = ({ data, onReset }) => {
                       )}
                     </td>
                     <td className="px-6 py-4 text-center">
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${row.counts.totalActive > 0 ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-800'}`}>
-                        {row.counts.totalActive}
-                      </span>
+                      <div className="flex flex-col items-center">
+                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${row.counts.totalActive > 0 ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-800'}`}>
+                          {row.counts.totalActive}
+                        </span>
+                        {row.counts.recentlyDeactivated > 0 && (
+                            <span className="mt-1 inline-flex items-center gap-1 text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-100" title="Bajas recientes incluidas en el cobro">
+                                <History size={10} />
+                                +{row.counts.recentlyDeactivated} bajas
+                            </span>
+                        )}
+                      </div>
+                      
                       {row.counts.totalActive > 0 && (
                           <div className="text-[10px] text-slate-400 mt-1">
                             {row.counts.wialon > 0 && `W:${row.counts.wialon} `}
@@ -179,7 +194,7 @@ const StatCard: React.FC<{ title: string; value: string; icon: React.ReactNode; 
       <div>
         <p className="text-sm font-medium text-slate-600 mb-1">{title}</p>
         <h3 className="text-2xl font-bold text-slate-900">{value}</h3>
-        {subtext && <p className="text-xs text-slate-500 mt-1">{subtext}</p>}
+        {subtext && <p className="text-xs text-slate-500 mt-1 flex items-center gap-1">{subtext}</p>}
       </div>
       <div className="p-2 bg-white rounded-lg shadow-sm">
         {icon}

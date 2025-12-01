@@ -1,4 +1,5 @@
-import { ConsolidatedRecord, ExcelRow } from '../types';
+
+import { ConsolidatedRecord, ExcelRow, ProcessingOptions } from '../types';
 
 // We access the global XLSX variable loaded via CDN in index.html
 declare const XLSX: any;
@@ -39,24 +40,41 @@ const getValue = (rowMap: Map<string, any>, possibleKeys: string[]): any => {
     return undefined;
 };
 
+// Parse flexible date formats (Excel serial number or string)
+const parseDate = (value: any): Date | null => {
+    if (!value) return null;
+
+    // Excel Serial Number
+    if (typeof value === 'number') {
+        // Excel base date is 1899-12-30
+        return new Date(Math.round((value - 25569) * 86400 * 1000));
+    }
+
+    // String Date (YYYY-MM-DD or DD/MM/YYYY)
+    if (typeof value === 'string') {
+        const clean = value.trim();
+        if (!clean) return null;
+        const d = new Date(clean);
+        if (!isNaN(d.getTime())) return d;
+    }
+
+    return null;
+};
+
 // Helper to check if a device is "Active" based on LEGACY sheet rules
-const isDeviceActive = (sheetName: string, rowMap: Map<string, any>): boolean => {
+const isDeviceActiveLegacy = (sheetName: string, rowMap: Map<string, any>): boolean => {
   if (sheetName === 'LEASE' || sheetName === 'WIALON') {
-    // Active if 'Desactivación' is empty, null, or undefined
-    // Check various common headers for deactivation
     const deactivationDate = getValue(rowMap, ['DESACTIVACIÓN', 'DESACTIVACION', 'FECHA DE BAJA', 'BAJA', 'DESACTIVADO']);
     return !deactivationDate;
   }
   
   if (sheetName === 'ADAS') {
-    // Active if Status is usually 'Online' or not 'Unuse'. 
     const status = getValue(rowMap, ['STATUS', 'ESTADO', 'ESTATUS']);
     const statusStr = status ? status.toString().toLowerCase() : '';
     return statusStr !== 'unuse' && statusStr !== 'baja' && statusStr !== 'inactive';
   }
 
   if (sheetName === 'COMBUSTIBLE') {
-    // Assuming all rows in this sheet are active sensors
     return true;
   }
 
@@ -66,23 +84,22 @@ const isDeviceActive = (sheetName: string, rowMap: Map<string, any>): boolean =>
 const createEmptyRecord = (id: string, name: string): ConsolidatedRecord => ({
   id,
   originalAccountName: name,
-  counts: { lease: 0, wialon: 0, combustible: 0, adas: 0, totalActive: 0 },
+  counts: { lease: 0, wialon: 0, combustible: 0, adas: 0, totalActive: 0, recentlyDeactivated: 0 },
   billing: { costoUnitario: 0, tipo: '-', observaciones: '-', nombreComercial: '' },
   calculatedTotal: 0,
-  hasDiscrepancy: false
+  hasDiscrepancy: false,
+  devices: []
 });
 
-export const processFiles = async (platformFile: File, costFile: File): Promise<ConsolidatedRecord[]> => {
+export const processFiles = async (platformFile: File, costFile: File, options: ProcessingOptions): Promise<ConsolidatedRecord[]> => {
   const platformData = await readExcel(platformFile);
   const costData = await readExcel(costFile);
 
   const accountMap = new Map<string, ConsolidatedRecord>();
+  const referenceTime = options.referenceDate.getTime();
+  const gracePeriodMs = options.gracePeriodDays * 24 * 60 * 60 * 1000;
 
   // 1. Process Platform File (Operations)
-  // Supports two formats:
-  // A) Consolidated: Single sheet with columns 'CLIENTE_CUENTA' and 'ORIGEN'.
-  // B) Legacy: Separate sheets named LEASE, WIALON, etc.
-  
   const platformSheets = Object.keys(platformData.Sheets);
   
   platformSheets.forEach(sheetName => {
@@ -104,13 +121,30 @@ export const processFiles = async (platformFile: File, costFile: File): Promise<
         rows.forEach(row => {
             const rowMap = createRowMap(row);
             
-            // Check for Deactivation Date - MUST BE EMPTY to be active
-            const deactivationDate = getValue(rowMap, ['FECHA_DE_DESACTIVACION', 'FECHA_DE_DE', 'FECHA DE DESACTIVACION', 'DESACTIVACION']);
+            const rawDate = getValue(rowMap, ['FECHA_DE_DESACTIVACION', 'FECHA_DE_DE', 'FECHA DE DESACTIVACION', 'DESACTIVACION']);
             
-            // If deactivation date is present and not just whitespace, skip (inactive)
-            if (deactivationDate && deactivationDate.toString().trim() !== '') {
-                return; 
+            let isBillable = false;
+            let isRecentlyDeactivated = false;
+            let deactivationDateObj: Date | null = null;
+
+            if (!rawDate || rawDate.toString().trim() === '') {
+                // Case 1: Active (No deactivation date)
+                isBillable = true;
+            } else {
+                // Case 2: Has deactivation date, check grace period
+                deactivationDateObj = parseDate(rawDate);
+                if (deactivationDateObj) {
+                    const diffTime = referenceTime - deactivationDateObj.getTime();
+                    // If diffTime is negative, date is in future (still active)
+                    // If diffTime is positive, check if within grace period
+                    if (diffTime < 0 || diffTime <= gracePeriodMs) {
+                        isBillable = true;
+                        isRecentlyDeactivated = true;
+                    }
+                }
             }
+
+            if (!isBillable) return;
 
             const accountRaw = getValue(rowMap, ['CLIENTE_CUENTA', 'CLIENTE_CUENT', 'CLIENTE']);
             const originRaw = getValue(rowMap, ['ORIGEN']);
@@ -124,13 +158,26 @@ export const processFiles = async (platformFile: File, costFile: File): Promise<
                 
                 const record = accountMap.get(normalizedAccount)!;
                 record.counts.totalActive++;
+                if (isRecentlyDeactivated) {
+                    record.counts.recentlyDeactivated++;
+                }
+
+                // Add detailed info for export
+                record.devices.push({
+                    name: getValue(rowMap, ['NOMBRE', 'NAME', 'UNIT', 'UNIDAD']) || 'S/N',
+                    imei: getValue(rowMap, ['IMEI']) || '-',
+                    deviceType: getValue(rowMap, ['TIPO_DE_DISPOSITIVO', 'DEVICE_TYPE', 'MODELO']) || '-',
+                    deactivationDate: deactivationDateObj ? deactivationDateObj.toISOString().split('T')[0] : (rawDate ? rawDate.toString() : ''),
+                    status: isRecentlyDeactivated ? 'BAJA_RECIENTE' : 'ACTIVO',
+                    platform: originRaw
+                });
 
                 // Map 'Origen' to platform counters
                 const originUpper = normalizeKey(originRaw);
                 if (originUpper.includes('WIALON')) record.counts.wialon++;
                 else if (originUpper.includes('ADAS')) record.counts.adas++;
                 else if (originUpper.includes('COMBUSTIBLE')) record.counts.combustible++;
-                else record.counts.lease++; // Default bucket (e.g. for 'LEASE' or 'RUPTELA')
+                else record.counts.lease++;
             }
         });
     } else {
@@ -148,8 +195,8 @@ export const processFiles = async (platformFile: File, costFile: File): Promise<
 
             rows.forEach(row => {
                 const rowMap = createRowMap(row);
-                // Apply legacy active check (looking for empty deactivation date)
-                if (isDeviceActive(sheetName, rowMap)) {
+                
+                if (isDeviceActiveLegacy(sheetName, rowMap)) {
                     const accountRaw = getValue(rowMap, accountKeys);
                     if (accountRaw) {
                         const normalizedAccount = normalizeKey(accountRaw);
@@ -160,7 +207,20 @@ export const processFiles = async (platformFile: File, costFile: File): Promise<
                         
                         const record = accountMap.get(normalizedAccount)!;
                         record.counts.totalActive++;
-                        record.counts[platformType!]++;
+                        if (platformType) {
+                             // @ts-ignore - dynamic key access safe due to if block
+                            record.counts[platformType]++;
+                        }
+
+                        // Add detailed info (Legacy - best effort)
+                        record.devices.push({
+                            name: getValue(rowMap, ['NOMBRE', 'NAME', 'UNIT', 'UNIDAD']) || 'S/N',
+                            imei: getValue(rowMap, ['IMEI', 'ID', 'SERIAL']) || '-',
+                            deviceType: getValue(rowMap, ['TIPO', 'MODELO']) || '-',
+                            deactivationDate: '',
+                            status: 'ACTIVO',
+                            platform: platformType!.toUpperCase()
+                        });
                     }
                 }
             });
@@ -169,7 +229,6 @@ export const processFiles = async (platformFile: File, costFile: File): Promise<
   });
 
   // 2. Process Cost File (Billing)
-  // Find the sheet, fallback to first one if specific name not found
   let costSheetName = Object.keys(costData.Sheets).find(name => 
       normalizeHeader(name).includes('COSTOS') || normalizeHeader(name).includes('SATECH')
   );
@@ -181,21 +240,16 @@ export const processFiles = async (platformFile: File, costFile: File): Promise<
     
     costRows.forEach(row => {
         const rowMap = createRowMap(row);
-        
-        // Find Account Column
         const accountRaw = getValue(rowMap, ['CUENTA', 'CLIENTE', 'ACCOUNT']);
         
         if (accountRaw) {
             const normalizedAccount = normalizeKey(accountRaw);
             
             if (!accountMap.has(normalizedAccount)) {
-                 // Account exists in billing but maybe not in platforms (active = 0)
                 accountMap.set(normalizedAccount, createEmptyRecord(normalizedAccount, accountRaw));
             }
 
             const record = accountMap.get(normalizedAccount)!;
-            
-            // Robust search for Cost column
             const rawCost = getValue(rowMap, ['COSTO', 'COSTO UNITARIO', 'PRECIO', 'IMPORTE', 'MONTO', 'VALOR', 'COSTOS']);
             record.billing.costoUnitario = parseCurrency(rawCost);
             
@@ -210,9 +264,7 @@ export const processFiles = async (platformFile: File, costFile: File): Promise<
   const results = Array.from(accountMap.values()).map(record => {
     record.calculatedTotal = record.counts.totalActive * record.billing.costoUnitario;
     
-    // Flag discrepancies: 
-    // 1. Has active units but 0 cost.
-    // 2. Has cost defined but 0 active units.
+    // Flag discrepancies
     if ((record.counts.totalActive > 0 && record.billing.costoUnitario === 0) || 
         (record.counts.totalActive === 0 && record.billing.costoUnitario > 0)) {
         record.hasDiscrepancy = true;
@@ -238,10 +290,15 @@ const readExcel = (file: File): Promise<any> => {
 };
 
 export const exportToExcel = (data: ConsolidatedRecord[]) => {
-    const exportData = data.map(r => ({
+    const wb = XLSX.utils.book_new();
+
+    // 1. Resumen Facturación
+    const exportSummary = data.map(r => ({
         'Cuenta': r.originalAccountName,
         'Nombre Comercial': r.billing.nombreComercial,
-        'Total Activos': r.counts.totalActive,
+        'Total Cobrable': r.counts.totalActive,
+        'Activos Reales': r.counts.totalActive - r.counts.recentlyDeactivated,
+        'Bajas Recientes (Cobrables)': r.counts.recentlyDeactivated,
         'Wialon': r.counts.wialon,
         'Lease': r.counts.lease,
         'ADAS': r.counts.adas,
@@ -251,9 +308,42 @@ export const exportToExcel = (data: ConsolidatedRecord[]) => {
         'Total a Cobrar': r.calculatedTotal,
         'Observaciones': r.billing.observaciones
     }));
+    const wsSummary = XLSX.utils.json_to_sheet(exportSummary);
+    XLSX.utils.book_append_sheet(wb, wsSummary, "Resumen Facturación");
 
-    const ws = XLSX.utils.json_to_sheet(exportData);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Reporte Facturación");
+    // 2. Detalle Bajas Recientes
+    const recentDeactivationsData = data.flatMap(record => 
+        record.devices
+            .filter(d => d.status === 'BAJA_RECIENTE')
+            .map(d => ({
+                'Cuenta': record.originalAccountName,
+                'Nombre Unidad': d.name,
+                'IMEI': d.imei,
+                'Tipo Dispositivo': d.deviceType,
+                'Fecha Baja': d.deactivationDate,
+                'Plataforma': d.platform,
+                'Estatus Cobro': 'COBRABLE (Regla de días)'
+            }))
+    );
+    if (recentDeactivationsData.length > 0) {
+        const wsRecent = XLSX.utils.json_to_sheet(recentDeactivationsData);
+        XLSX.utils.book_append_sheet(wb, wsRecent, "Detalle Bajas Cobrables");
+    }
+
+    // 3. Detalle Global Activos (Absolutamente todo)
+    const allDetailsData = data.flatMap(record => 
+        record.devices.map(d => ({
+            'Cuenta': record.originalAccountName,
+            'Nombre Unidad': d.name,
+            'IMEI': d.imei,
+            'Tipo Dispositivo': d.deviceType,
+            'Fecha Baja': d.deactivationDate,
+            'Plataforma': d.platform,
+            'Estatus': d.status
+        }))
+    );
+    const wsAll = XLSX.utils.json_to_sheet(allDetailsData);
+    XLSX.utils.book_append_sheet(wb, wsAll, "Detalle Global Activos");
+
     XLSX.writeFile(wb, "Satech_Reporte_Facturacion.xlsx");
 };
