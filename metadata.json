@@ -1,0 +1,5 @@
+{
+  "name": "Satech Billing Reconciler",
+  "description": "Herramienta de conciliación financiera para cruzar datos operativos de rastreo (Wialon, Lease, ADAS) con costos de facturación para calcular cobros precisos por cliente.",
+  "requestFramePermissions": []
+}
